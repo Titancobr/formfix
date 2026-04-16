@@ -9,7 +9,7 @@ const BottomNav = () => {
     { to: "/", icon: Home, label: "Home" },
     { to: "/workouts", icon: Dumbbell, label: "Workouts" },
     { to: "/recipes", icon: UtensilsCrossed, label: "Recipes" },
-    /*{ to: "/scan", icon: ScanLine, label: "Scan" },*/
+    { to: "/scan", icon: ScanLine, label: "Scan" },
   ];
 
   return (

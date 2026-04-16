@@ -4,6 +4,8 @@ import { useSearchParams, useNavigate } from "react-router-dom";
 import {
   ArrowLeft,
   CheckCircle2,
+  Eye,
+  EyeOff,
   Loader2,
   Mic2,
   RotateCcw,
@@ -31,6 +33,9 @@ type AiResult = {
   correction: string;
   landmarks: Landmark[];
   tracked_angle: number;
+  tracked_angle_label?: string;
+  tracked_angle_definition?: string;
+  common_mistake: string;
   ready: boolean;
 };
 
@@ -70,11 +75,13 @@ const Camera = () => {
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
   const requestInFlight = useRef(false);
   const lastSpokenRef = useRef("");
+  const lastSpokenAtRef = useRef(0);
   const milestonesSpokenRef = useRef<Set<number>>(new Set());
 
   const [aiResult, setAiResult] = useState<AiResult | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [showSkeleton, setShowSkeleton] = useState(false);
 
   const planId = searchParams.get("plan") || "ppl";
   const dayId = searchParams.get("day") || "";
@@ -104,13 +111,16 @@ const Camera = () => {
   const speak = (text: string) => {
     if (!voiceEnabled || !("speechSynthesis" in window)) return;
     if (!text || text === "Good form" || text === lastSpokenRef.current) return;
+    const now = Date.now();
+    if (now - lastSpokenAtRef.current < 2200) return;
 
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 0.95;
-    utterance.pitch = 1;
+    utterance.rate = 0.92;
+    utterance.pitch = 0.95;
     window.speechSynthesis.speak(utterance);
     lastSpokenRef.current = text;
+    lastSpokenAtRef.current = now;
   };
 
   const drawSkeleton = (landmarks: Landmark[]) => {
@@ -159,11 +169,11 @@ const Camera = () => {
     requestInFlight.current = true;
     setIsAnalyzing(true);
 
-    canvas.width = 512;
-    canvas.height = Math.round((video.videoHeight / video.videoWidth) * 512);
+    canvas.width = 384;
+    canvas.height = Math.round((video.videoHeight / video.videoWidth) * 384);
     const ctx = canvas.getContext("2d");
     ctx?.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const image = canvas.toDataURL("image/jpeg", 0.72);
+    const image = canvas.toDataURL("image/jpeg", 0.62);
 
     try {
       const response = await fetch(`${API_URL}/ai/analyze-frame`, {
@@ -174,13 +184,21 @@ const Camera = () => {
           exercise: targetExerciseName,
           session_id: sessionId,
           reset,
+          include_landmarks: showSkeleton,
         }),
       });
 
       if (!response.ok) throw new Error("AI analysis failed");
       const data = (await response.json()) as AiResult;
       setAiResult(data);
-      drawSkeleton(data.landmarks || []);
+      if (showSkeleton) {
+        drawSkeleton(data.landmarks || []);
+      } else {
+        const overlayCtx = canvasRef.current?.getContext("2d");
+        if (overlayCtx && canvasRef.current) {
+          overlayCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+        }
+      }
 
       if (data.correction) speak(data.correction);
 
@@ -200,6 +218,9 @@ const Camera = () => {
         correction: "AI backend is not connected. Start the FastAPI server.",
         landmarks: [],
         tracked_angle: 0,
+        common_mistake: "",
+        tracked_angle_label: "Tracked angle",
+        tracked_angle_definition: "exercise-specific joints",
         ready: false,
       }));
     } finally {
@@ -211,9 +232,9 @@ const Camera = () => {
   useEffect(() => {
     if (!isActive) return;
     analyzeFrame(true);
-    const interval = window.setInterval(() => analyzeFrame(false), 450);
+    const interval = window.setInterval(() => analyzeFrame(false), 320);
     return () => window.clearInterval(interval);
-  }, [isActive, sessionId, targetExerciseName]);
+  }, [isActive, sessionId, targetExerciseName, showSkeleton]);
 
   useEffect(() => {
     return () => {
@@ -225,7 +246,7 @@ const Camera = () => {
     return <div className="p-10 text-center">Workout not found.</div>;
   }
 
-  const finishWorkout = async () => {
+  const saveProgress = async (status: "completed" | "skipped") => {
     const totalExercises = day?.exercises.length || 0;
     if (fitUser?.user_id) {
       try {
@@ -240,7 +261,8 @@ const Camera = () => {
             exercise_id: selectedExercise.id,
             exercise_name: selectedExercise.name,
             reps,
-            completed: true,
+            completed: status === "completed",
+            status,
             total_exercises: totalExercises,
           }),
         });
@@ -248,7 +270,36 @@ const Camera = () => {
         // UI still continues even if progress sync fails.
       }
     }
+  };
+
+  const saveExerciseReport = async () => {
+    try {
+      const response = await fetch(`${API_URL}/ai/session-report`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId,
+          exercise: targetExerciseName,
+        }),
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      localStorage.setItem("lastExerciseReport", JSON.stringify(data));
+    } catch {
+      // Report is optional; workout flow should continue.
+    }
+  };
+
+  const finishWorkout = async () => {
+    await saveExerciseReport();
+    await saveProgress("completed");
     navigate(`/workout/${planId}/${dayId}?completed=${selectedExercise.id}`);
+  };
+
+  const cancelWorkout = async () => {
+    await saveExerciseReport();
+    await saveProgress("skipped");
+    navigate(`/workout/${planId}/${dayId}?skipped=${selectedExercise.id}`);
   };
 
   return (
@@ -265,14 +316,25 @@ const Camera = () => {
           </p>
           <h2 className="font-heading text-2xl uppercase leading-none">{targetExerciseName}</h2>
         </div>
-        <button
-          onClick={() => setVoiceEnabled((value) => !value)}
-          className={`p-3 rounded-full backdrop-blur-md ${
-            voiceEnabled ? "bg-primary text-black" : "bg-white/10 text-white"
-          }`}
-        >
-          <Mic2 className="w-5 h-5" />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowSkeleton((value) => !value)}
+            className={`p-3 rounded-full backdrop-blur-md ${
+              showSkeleton ? "bg-sky-500/90 text-white" : "bg-white/10 text-white"
+            }`}
+            title="Toggle skeleton overlay"
+          >
+            {showSkeleton ? <Eye className="w-5 h-5" /> : <EyeOff className="w-5 h-5" />}
+          </button>
+          <button
+            onClick={() => setVoiceEnabled((value) => !value)}
+            className={`p-3 rounded-full backdrop-blur-md ${
+              voiceEnabled ? "bg-primary text-black" : "bg-white/10 text-white"
+            }`}
+          >
+            <Mic2 className="w-5 h-5" />
+          </button>
+        </div>
       </div>
 
       <div className="absolute inset-0 flex items-center justify-center bg-zinc-950">
@@ -300,98 +362,121 @@ const Camera = () => {
         <canvas ref={captureCanvasRef} className="hidden" />
       </div>
 
-      <div className="absolute top-28 left-5 right-5 z-30 grid grid-cols-3 gap-3">
+      <div className="absolute top-24 right-5 z-30 flex gap-2 pointer-events-none">
         {[8, 12, 15].map((milestone) => (
           <div
             key={milestone}
-            className={`rounded-2xl border p-3 backdrop-blur-xl ${
+            className={`min-w-[62px] rounded-full border px-3 py-2 backdrop-blur-md ${
               reps >= milestone
                 ? "border-primary bg-primary/20 text-primary"
-                : "border-white/10 bg-black/35 text-white/55"
+                : "border-white/10 bg-black/20 text-white/45"
             }`}
           >
-            <p className="font-heading text-2xl leading-none">{milestone}</p>
-            <p className="text-[9px] font-mono uppercase tracking-widest">Rep Reminder</p>
+            <p className="font-heading text-base leading-none text-center">{milestone}</p>
+            <p className="text-[8px] font-mono uppercase tracking-widest text-center">Reps</p>
           </div>
         ))}
       </div>
 
-      <div className="absolute bottom-0 left-0 right-0 z-30 p-5 pb-8 bg-gradient-to-t from-black via-black/80 to-transparent">
-        <div className="glass-card-static p-5 border-white/10">
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <p className="text-[10px] font-mono text-primary uppercase tracking-[0.28em]">
-                Current Movement
-              </p>
-              <h3 className="text-3xl font-heading uppercase leading-none mt-1">
-                {aiResult?.display_name || targetExerciseName}
-              </h3>
-            </div>
-            <AnimatePresence mode="popLayout">
-              <motion.div
-                key={reps}
-                initial={{ scale: 0.7, opacity: 0 }}
-                animate={{ scale: 1, opacity: 1 }}
-                exit={{ scale: 1.2, opacity: 0 }}
-                className="text-right"
-              >
-                <p className="text-6xl font-heading text-primary leading-none">{reps}</p>
-                <p className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground">
-                  Reps Done
-                </p>
-              </motion.div>
-            </AnimatePresence>
-          </div>
+      <div className="absolute bottom-0 left-0 right-0 z-30 p-4 pb-6 bg-gradient-to-t from-black/65 via-black/20 to-transparent">
+        <div className="mx-auto max-w-5xl">
+          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_340px]">
+            <div className="rounded-3xl border border-white/10 bg-black/20 px-4 py-3 backdrop-blur-xl shadow-[0_18px_60px_rgba(0,0,0,0.32)]">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-[10px] font-mono text-primary uppercase tracking-[0.28em]">
+                    Live Coaching
+                  </p>
+                  <h3 className="mt-1 text-xl font-heading uppercase leading-none">
+                    {aiResult?.display_name || targetExerciseName}
+                  </h3>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <div className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">
+                      <p className="text-[9px] font-mono uppercase text-muted-foreground">Stage</p>
+                      <p className="font-heading text-sm uppercase">{aiResult?.stage || "Ready"}</p>
+                    </div>
+                    <div className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">
+                      <p className="text-[9px] font-mono uppercase text-muted-foreground">
+                        {aiResult?.tracked_angle_label || "Tracked angle"}
+                      </p>
+                      <p className="font-heading text-sm">{aiResult?.tracked_angle || 0}°</p>
+                      <p className="text-[8px] font-mono uppercase tracking-[0.18em] text-white/45">
+                        {aiResult?.tracked_angle_definition || "exercise-specific joints"}
+                      </p>
+                    </div>
+                    <div className="rounded-full border border-primary/20 bg-primary/10 px-3 py-1.5">
+                      <p className="text-[9px] font-mono uppercase text-primary/80">Coach</p>
+                      <p className="font-heading text-sm text-primary">{isAnalyzing ? "Live" : "Ready"}</p>
+                    </div>
+                  </div>
+                </div>
+                <AnimatePresence mode="popLayout">
+                  <motion.div
+                    key={reps}
+                    initial={{ scale: 0.7, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    exit={{ scale: 1.2, opacity: 0 }}
+                    className="rounded-3xl border border-primary/20 bg-primary/10 px-4 py-3 text-right"
+                  >
+                    <p className="text-4xl font-heading text-primary leading-none">{reps}</p>
+                    <p className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground">
+                      Reps Done
+                    </p>
+                  </motion.div>
+                </AnimatePresence>
+              </div>
 
-          <div className="grid grid-cols-3 gap-3 mb-4">
-            <div className="rounded-xl bg-white/5 p-3 border border-white/10">
-              <p className="text-[9px] font-mono uppercase text-muted-foreground">Stage</p>
-              <p className="font-heading text-xl uppercase">{aiResult?.stage || "Ready"}</p>
+              <div className="mt-3 rounded-2xl border border-primary/20 bg-black/20 px-4 py-3">
+                <div className="flex gap-3 items-start">
+                  <div className="mt-0.5 rounded-full bg-primary/15 p-2">
+                    <Sparkles className="w-4 h-4 text-primary" />
+                  </div>
+                  <div>
+                    <p className="text-[10px] font-mono uppercase tracking-[0.28em] text-primary/80">
+                      Coach Cue
+                    </p>
+                    <p className="mt-1 text-sm leading-relaxed text-white/92">
+                      {aiResult?.correction || "Get ready. I will count clean reps and guide your form."}
+                    </p>
+                  </div>
+                </div>
+              </div>
             </div>
-            <div className="rounded-xl bg-white/5 p-3 border border-white/10">
-              <p className="text-[9px] font-mono uppercase text-muted-foreground">Angle</p>
-              <p className="font-heading text-xl">{aiResult?.tracked_angle || 0}°</p>
-            </div>
-            <div className="rounded-xl bg-white/5 p-3 border border-white/10">
-              <p className="text-[9px] font-mono uppercase text-muted-foreground">AI</p>
-              <p className="font-heading text-xl">{isAnalyzing ? "Live" : "Ready"}</p>
-            </div>
-          </div>
 
-          <div className="rounded-2xl border border-primary/20 bg-primary/10 p-4 flex gap-3 items-start mb-4">
-            <Sparkles className="w-5 h-5 text-primary mt-0.5 flex-shrink-0" />
-            <p className="text-sm leading-relaxed">
-              {aiResult?.correction || "Get ready. I will count clean reps and correct your form."}
-            </p>
-          </div>
+            <div className="rounded-3xl border border-white/10 bg-black/20 p-3 backdrop-blur-xl shadow-[0_18px_60px_rgba(0,0,0,0.28)]">
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  variant="outline"
+                  className="h-11 rounded-2xl border-white/10 bg-white/5 text-white hover:bg-white/10"
+                  onClick={cancelWorkout}
+                >
+                  <X className="w-4 h-4 mr-2" />
+                  Cancel
+                </Button>
+                {canFinish ? (
+                  <Button
+                    className="h-11 rounded-2xl bg-primary text-black font-heading text-base tracking-wide hover:bg-primary/90"
+                    onClick={finishWorkout}
+                  >
+                    <CheckCircle2 className="w-4 h-4 mr-2" />
+                    Finish
+                  </Button>
+                ) : (
+                  <Button
+                    variant="outline"
+                    className="h-11 rounded-2xl border-primary/30 bg-primary/10 text-primary"
+                    onClick={() => analyzeFrame(true)}
+                  >
+                    <RotateCcw className="w-4 h-4 mr-2" />
+                    Reset
+                  </Button>
+                )}
+              </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <Button
-              variant="outline"
-              className="h-13 border-white/10 bg-white/5 text-white hover:bg-white/10"
-              onClick={() => navigate(-1)}
-            >
-              <X className="w-4 h-4 mr-2" />
-              Cancel
-            </Button>
-            {canFinish ? (
-              <Button
-                className="h-13 bg-primary text-black font-heading text-lg tracking-widest hover:bg-primary/90"
-                onClick={finishWorkout}
-              >
-                <CheckCircle2 className="w-4 h-4 mr-2" />
-                Finish
-              </Button>
-            ) : (
-              <Button
-                variant="outline"
-                className="h-13 border-primary/30 bg-primary/10 text-primary"
-                onClick={() => analyzeFrame(true)}
-              >
-                <RotateCcw className="w-4 h-4 mr-2" />
-                Reset
-              </Button>
-            )}
+              <div className="mt-2 text-[11px] leading-relaxed text-white/60">
+                Finish unlocks once you reach 8 clean reps. Cancel keeps this exercise available to return later.
+              </div>
+            </div>
           </div>
         </div>
       </div>
